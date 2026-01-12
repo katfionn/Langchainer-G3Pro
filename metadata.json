@@ -1,0 +1,5 @@
+{
+  "name": "LangChain AutoPlanner",
+  "description": "A comprehensive interface for generating, managing, and executing LangChain autonomous agent workflows using Gemini AI.",
+  "requestFramePermissions": []
+}
