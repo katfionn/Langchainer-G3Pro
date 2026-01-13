@@ -1,3 +1,4 @@
+
 import { GoogleGenAI } from "@google/genai";
 import { AUTO_PLANNER_SYSTEM_PROMPT } from "../constants";
 
@@ -7,9 +8,9 @@ export type AIChannel = 'google' | 'openai' | 'compatible' | 'openrouter';
  * 网络请求配置：控制重试次数与探测频率
  */
 export const NETWORK_CONFIG = {
-  MIN_CHECK_INTERVAL: 30000,   // 两次检查之间的最小强制间隔 (30秒)
-  REQUEST_TIMEOUT: 10000,      // 请求超时 (10秒)
-  PENALTY_DELAY: 45000         // 遇到 429 后的额外惩罚延迟 (45秒)
+  MIN_CHECK_INTERVAL: 20000,   
+  REQUEST_TIMEOUT: 15000,      
+  PENALTY_DELAY: 60000         
 };
 
 // 内部状态追踪
@@ -31,7 +32,7 @@ export interface AIConfig {
   apiKey: string;
   baseUrl?: string;
   models: ModelInstance[];
-  isInternal?: boolean; // 标识是否为 aistudio 平台内置
+  isInternal?: boolean; 
 }
 
 export interface ConnectivityReport {
@@ -81,24 +82,21 @@ export const getConfigs = (): AIConfig[] => {
 
 export const getActiveModel = () => {
   const configs = getConfigs();
-  const userPrimary = configs.find(c => c.models.some(m => m.isPrimary));
-  if (userPrimary) {
-    const model = userPrimary.models.find(m => m.isPrimary)!;
-    return { config: userPrimary, model };
+  const userPrimaryConfig = configs.find(c => c.models.some(m => m.isPrimary));
+  if (userPrimaryConfig) {
+    const model = userPrimaryConfig.models.find(m => m.isPrimary)!;
+    return { config: userPrimaryConfig, model };
   }
   return { config: INTERNAL_CONFIG, model: INTERNAL_CONFIG.models[0] };
 };
 
 /**
- * 带有冷却机制的连通性检查，防止 429 报错无限产生
- * @param force 是否忽略频率限制强制发起请求
+ * 带有跨域优化的连通性检查
  */
 export const checkConnectivity = async (force: boolean = false): Promise<ConnectivityReport> => {
   const now = Date.now();
   
-  // 冷却判定：如果未强制且未过冷却期，直接返回上一次缓存
   if (!force && cachedReport && (now - lastCheckTime < NETWORK_CONFIG.MIN_CHECK_INTERVAL)) {
-    console.debug('Connectivity check skipped due to cooling period.');
     return { ...cachedReport, timestamp: now };
   }
 
@@ -106,16 +104,19 @@ export const checkConnectivity = async (force: boolean = false): Promise<Connect
   const start = Date.now();
   
   try {
+    if (!model.modelId && !config.isInternal) {
+      throw new Error("Missing Model ID");
+    }
+
     let report: ConnectivityReport;
     if (config.channel === 'google') {
       const key = (config.isInternal ? process.env.API_KEY : config.apiKey) || process.env.API_KEY || '';
       if (!key) return { success: false, message: "API Key missing", channel: 'Google', timestamp: now };
       
       const ai = new GoogleGenAI({ apiKey: key });
-      // 这里的 generateContent 是受限的，不要频繁调用
       await ai.models.generateContent({
-        model: model.modelId,
-        contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+        model: model.modelId || 'gemini-3-flash-preview',
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
         config: { maxOutputTokens: 1 }
       });
       
@@ -128,25 +129,51 @@ export const checkConnectivity = async (force: boolean = false): Promise<Connect
         timestamp: Date.now()
       };
     } else {
-      const url = config.channel === 'openrouter' 
-        ? "https://openrouter.ai/api/v1/chat/completions" 
-        : `${config.baseUrl || 'https://api.openai.com/v1'}/chat/completions`;
+      // 核心修正点：根据 channel 决定基础 URL
+      let base = "";
+      if (config.channel === 'openrouter') {
+        base = "https://openrouter.ai/api/v1";
+      } else if (config.channel === 'openai') {
+        base = config.baseUrl || "https://api.openai.com/v1";
+      } else {
+        base = config.baseUrl || "";
+      }
+      
+      base = base.trim().replace(/\/+$/, '');
+      const url = `${base}/chat/completions`;
       
       const controller = new AbortController();
       const tId = setTimeout(() => controller.abort(), NETWORK_CONFIG.REQUEST_TIMEOUT);
 
+      // 极致跨域优化：手动清理 Headers 确保简单请求特征
+      const headers: Record<string, string> = {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json'
+      };
+
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: model.modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+        mode: 'cors',
+        headers: headers,
+        body: JSON.stringify({ 
+          model: model.modelId, 
+          messages: [{ role: 'user', content: 'hi' }], 
+          max_tokens: 5,
+          stream: false 
+        }),
         signal: controller.signal
       });
       clearTimeout(tId);
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const msg = errData.error?.message || `Status: ${res.status}`;
+        throw new Error(msg);
+      }
+
       report = { 
         success: true, 
-        message: "Gateway Response OK", 
+        message: "Connect OK", 
         latency: Date.now() - start, 
         modelId: model.modelId, 
         channel: config.channel,
@@ -159,18 +186,13 @@ export const checkConnectivity = async (force: boolean = false): Promise<Connect
     return report;
 
   } catch (e: any) {
-    const isRateLimit = e.message?.includes('429') || e.status === 429;
-    
-    // 如果是 429 速率限制，人为向后推迟下一次允许检查的时间点
-    if (isRateLimit) {
-        lastCheckTime = Date.now() + NETWORK_CONFIG.PENALTY_DELAY;
-    } else {
-        lastCheckTime = Date.now();
-    }
+    let errorMsg = e.message || "Network Error";
+    if (e.name === 'AbortError') errorMsg = "Request Timeout (Check Proxy/CORS)";
+    if (e.message === 'Failed to fetch') errorMsg = "CORS Blocked. Ensure your proxy allows current Origin.";
 
     const errorReport = { 
         success: false, 
-        message: isRateLimit ? "Rate Limit (429): Retrying in 45s" : (e.message || "Unknown error"), 
+        message: errorMsg, 
         channel: config.channel,
         timestamp: Date.now()
     };
@@ -190,11 +212,9 @@ export const generateProjectPlan = async (
 
   if (config.channel === 'google') {
     const key = (config.isInternal ? process.env.API_KEY : config.apiKey) || process.env.API_KEY || '';
-    if (!key) throw new Error("API Key is missing.");
-
     const ai = new GoogleGenAI({ apiKey: key });
     const result = await ai.models.generateContentStream({
-      model: model.modelId,
+      model: model.modelId || 'gemini-3-pro-preview',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: { systemInstruction: systemPrompt, temperature: 0.7 }
     });
@@ -203,17 +223,29 @@ export const generateProjectPlan = async (
       if (chunk.text) onStream(chunk.text);
     }
   } else {
-    const baseUrl = config.channel === 'openrouter' ? "https://openrouter.ai/api/v1" : (config.baseUrl || "https://api.openai.com/v1");
-    const headers: Record<string, string> = { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' };
+    // 核心修正点：确保生成计划时也使用最新的 channel 对应 URL
+    let base = "";
+    if (config.channel === 'openrouter') {
+      base = "https://openrouter.ai/api/v1";
+    } else if (config.channel === 'openai') {
+      base = config.baseUrl || "https://api.openai.com/v1";
+    } else {
+      base = config.baseUrl || "";
+    }
+    base = base.trim().replace(/\/+$/, '');
     
     let extraParams = {};
     if (model.customParams) {
       try { extraParams = JSON.parse(model.customParams); } catch (e) {}
     }
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await fetch(`${base}/chat/completions`, {
       method: "POST",
-      headers,
+      mode: 'cors',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`, 
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({
         model: model.modelId,
         messages: [{ role: "system", content: systemPrompt }, { role: "user", content: prompt }],
@@ -222,22 +254,33 @@ export const generateProjectPlan = async (
       }),
     });
 
-    if (!response.ok) throw new Error(`Provider error: ${response.status}`);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Error ${response.status}`);
+    }
+
     const reader = response.body?.getReader();
     const decoder = new TextDecoder();
+    let buffer = "";
+
     while (reader) {
       const { done, value } = await reader.read();
       if (done) break;
-      const chunk = decoder.decode(value);
-      const lines = chunk.split("\n").filter(l => l.startsWith("data: "));
+      
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
       for (const line of lines) {
-        const data = line.replace("data: ", "");
-        if (data === "[DONE]") break;
-        try {
-          const json = JSON.parse(data);
-          const content = json.choices[0]?.delta?.content;
-          if (content) onStream(content);
-        } catch {}
+        const cleanLine = line.trim();
+        if (!cleanLine || cleanLine === "data: [DONE]") continue;
+        if (cleanLine.startsWith("data: ")) {
+          try {
+            const json = JSON.parse(cleanLine.substring(6));
+            const content = json.choices[0]?.delta?.content;
+            if (content) onStream(content);
+          } catch (e) {}
+        }
       }
     }
   }
